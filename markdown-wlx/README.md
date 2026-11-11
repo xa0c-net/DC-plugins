@@ -57,6 +57,18 @@ EXT="MD"|EXT="MARKDOWN"|EXT="MDOWN"|EXT="MKD"|EXT="MKDN"|EXT="MDWN"|EXT="MDTXT"|
 
 Select a `.md` file and press **F3** (internal viewer). It opens rendered.
 
+### Links
+
+- Links to other Markdown files (`[x](other.md)`, `[x](../notes/y.md#section)`) render
+  in the same viewer, scrolled to the `#section` if given. **Cmd+[** (or **Cmd+Left**)
+  goes back; the history resets when you move to another file with Double Commander.
+- `#anchor` links scroll within the page. Headings get GitHub-style ids
+  (`## Second Section` → `#second-section`, duplicates get `-1`, `-2`).
+- `http(s)`, `mailto` and `tel` links open in the system handler; other local files
+  open with their default app (executables are only revealed in Finder, never run).
+- Limitation: the viewer's window title and DC's next/previous-file navigation still
+  refer to the file you originally opened.
+
 ### Printing
 
 Choose **File → Print** in the viewer to open the macOS print dialog. Print the
@@ -210,6 +222,8 @@ Double Commander does. Build them with:
   and tables, and that an escaped `\\(…\\)` and prose dollar amounts are left alone.
 - `test/esc_probe.m` — the diagnostic probe used to find the root cause (whether
   `keyDown:` reaches a `WKWebView` subclass and forwarding reaches the parent).
+- `test/link_verify.m` — link handling: relative `.md` links render in place (with
+  `#anchor`), in-page anchors scroll, Cmd+[ goes back.
 - `test/scroll_verify.m` — scroll-restore regression: scroll a file, navigate away
   and back, assert the offset is restored.
 - `test/assets_verify.m` — asset-loading regression: stages the built plugin plus

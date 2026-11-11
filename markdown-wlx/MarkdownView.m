@@ -109,11 +109,21 @@ static BOOL CfgBool(NSDictionary *cfg, NSString *key) {
  * Escape event so NSApplication dispatches it normally and LCL closes the
  * viewer. Every other key is left to normal web handling (scrolling, find,
  * text selection). */
+@protocol MDBackHandler <NSObject>
+- (BOOL)goBack;
+@end
+
 @interface MDWebView : WKWebView
 @end
 
 @implementation MDWebView
 - (void)keyDown:(NSEvent *)event {
+    /* Cmd+[ / Cmd+Left: go back after following a link to another Markdown file. */
+    NSEventModifierFlags mods = event.modifierFlags & NSEventModifierFlagDeviceIndependentFlagsMask;
+    if (mods == NSEventModifierFlagCommand && (event.keyCode == 33 /* [ */ || event.keyCode == 123 /* left */)) {
+        id<MDBackHandler> h = (id<MDBackHandler>)self.superview;
+        if ([h respondsToSelector:@selector(goBack)] && [h goBack]) return;
+    }
     if (event.keyCode != 53 /* kVK_Escape */) {
         [super keyDown:event];
         return;
@@ -283,7 +293,7 @@ static NSString *AssetMime(NSString *path) {
 @property (nonatomic, weak) MDView *owner;
 @end
 
-@interface MDView : NSView
+@interface MDView : NSView <WKNavigationDelegate, MDBackHandler>
 @property (nonatomic, strong) WKWebView *web;
 @property (nonatomic, strong) MDScrollSink *sink;
 @property (nonatomic, strong) MDAssetHandler *assets;
@@ -296,7 +306,11 @@ static NSString *AssetMime(NSString *path) {
 @property (nonatomic, strong) NSPrintInfo *pendingPrintInfo;
 @property (nonatomic, strong) NSPrintOperation *printOperation;
 @property (nonatomic, strong) MDPrintFooter *printFooter;
+/* Paths visited by following Markdown links, for Cmd+[ (cleared when the host navigates). */
+@property (nonatomic, strong) NSMutableArray<NSString *> *history;
 - (BOOL)loadMarkdownAtPath:(NSString *)mdPath;
+- (BOOL)loadMarkdownAtPath:(NSString *)mdPath anchor:(NSString *)anchor;
+- (BOOL)goBack;
 - (void)findText:(NSString *)text flags:(int)flags;
 - (void)startPendingPrint;
 - (BOOL)printWithInfo:(NSPrintInfo *)info;
@@ -326,6 +340,7 @@ static NSString *AssetMime(NSString *path) {
     if (self) {
         self.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
         _scrollByPath = [NSMutableDictionary dictionary];
+        _history = [NSMutableArray array];
 
         _sink = [[MDScrollSink alloc] init];
         _sink.owner = self;
@@ -339,6 +354,7 @@ static NSString *AssetMime(NSString *path) {
         _web = [[MDWebView alloc] initWithFrame:self.bounds configuration:cfg];
         _printFooter = [[MDPrintFooter alloc] init];
         _web.UIDelegate = _printFooter; /* WebKit holds UI delegates weakly. */
+        _web.navigationDelegate = self;
         _web.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
         @try { [_web setValue:@NO forKey:@"drawsBackground"]; } @catch (__unused id e) {}
         [self addSubview:_web];
@@ -351,6 +367,10 @@ static NSString *AssetMime(NSString *path) {
 }
 
 - (BOOL)loadMarkdownAtPath:(NSString *)mdPath {
+    return [self loadMarkdownAtPath:mdPath anchor:nil];
+}
+
+- (BOOL)loadMarkdownAtPath:(NSString *)mdPath anchor:(NSString *)anchor {
     if (self.closed || self.printOperation) return NO;
     /* Navigation cancels a queued request; a stale page's ready message must
      * never print the next file instead. */
@@ -364,6 +384,12 @@ static NSString *AssetMime(NSString *path) {
 
     self.currentPath = mdPath;
     long savedY = [self.scrollByPath[mdPath] longValue];
+    NSString *anchorJS = @"null";
+    if (anchor.length) {
+        NSData *j = [NSJSONSerialization dataWithJSONObject:@[anchor] options:0 error:nil];
+        NSString *arr = j ? [[NSString alloc] initWithData:j encoding:NSUTF8StringEncoding] : nil;
+        if (arr.length > 2) anchorJS = [arr substringWithRange:NSMakeRange(1, arr.length - 2)];
+    }
 
     NSDictionary *cfg = ReadConfig();
     NSString *theme = [[cfg[@"theme"] description] lowercaseString];
@@ -440,7 +466,7 @@ static NSString *AssetMime(NSString *path) {
     }
 
     NSString *bootstrap = [NSString stringWithFormat:@""
-        "var __theme=\"%@\";var __scrollY=%ld;var __mathDollar=%d;var __wantMath=%d;"
+        "var __theme=\"%@\";var __scrollY=%ld;var __mathDollar=%d;var __wantMath=%d;var __anchor=%@;"
         "window.addEventListener('load',async function(){"
         "var b64=document.getElementById('md-data').textContent.trim();"
         "var md=new TextDecoder('utf-8').decode(Uint8Array.from(atob(b64),function(c){return c.charCodeAt(0);}));"
@@ -464,7 +490,19 @@ static NSString *AssetMime(NSString *path) {
         "try{content.querySelectorAll('pre code:not(.language-mermaid)').forEach(function(el){hljs.highlightElement(el);});}catch(e){}"
         /* Render the spans the tokenizers left behind, after sanitizing. */
         "if(__wantMath&&window.__dcMathRender)try{__dcMathRender(content);}catch(e){}"
-        "try{if(__scrollY>0)window.scrollTo(0,__scrollY);}catch(e){}"
+        /* GitHub-style heading ids (marked >= 8 no longer emits them), so #anchor
+         * links work; duplicates get -1, -2, ... like on GitHub. */
+        "var seen={};content.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function(h){"
+          "if(h.id)return;var s=h.textContent.trim().toLowerCase().replace(/[^\\p{L}\\p{N}\\s_-]/gu,'').replace(/\\s/g,'-');"
+          "var n=seen[s]||0;seen[s]=n+1;h.id=n?s+'-'+n:s;});"
+        "function goAnchor(a){if(!a)return false;var id=a;try{id=decodeURIComponent(a);}catch(e){}"
+          "var el=document.getElementById(id)||document.getElementById(a)||document.getElementsByName(id)[0];"
+          "if(el){el.scrollIntoView();return true;}return false;}"
+        /* With <base href>, a bare #frag link would resolve against the folder and
+         * navigate away from this page, so handle in-page anchors here. */
+        "document.addEventListener('click',function(e){var a=e.target.closest&&e.target.closest('a[href]');"
+          "if(!a)return;var h=a.getAttribute('href');if(h&&h.charAt(0)==='#'){e.preventDefault();goAnchor(h.slice(1));}});"
+        "try{if(__anchor&&goAnchor(__anchor)){}else if(__scrollY>0)window.scrollTo(0,__scrollY);}catch(e){}"
         "var post=function(){try{window.webkit.messageHandlers.dcmd.postMessage(window.scrollY);}catch(e){}};"
         "var t=null;window.addEventListener('scroll',function(){if(t)return;t=setTimeout(function(){t=null;post();},120);},{passive:true});"
         /* Wait only for printing; slow resources must not delay scroll tracking.
@@ -474,7 +512,7 @@ static NSString *AssetMime(NSString *path) {
           "return img.complete?Promise.resolve():new Promise(function(resolve){"
           "img.addEventListener('load',resolve,{once:true});img.addEventListener('error',resolve,{once:true});});})]);"
         "window.webkit.messageHandlers.dcmd.postMessage({ready:'%@'});"
-        "});", theme, savedY, allowDollar ? 1 : 0, wantMath ? 1 : 0, self.loadToken];
+        "});", theme, savedY, allowDollar ? 1 : 0, wantMath ? 1 : 0, anchorJS, self.loadToken];
 
     NSMutableString *html = [NSMutableString string];
     [html appendString:@"<!DOCTYPE html><html><head><meta charset=\"utf-8\">"
@@ -502,6 +540,61 @@ static NSString *AssetMime(NSString *path) {
     NSURL *rootURL = [NSURL fileURLWithPath:@"/" isDirectory:YES];
     [self.web loadFileURL:fileURL allowingReadAccessToURL:rootURL];
     return YES;
+}
+
+#pragma mark - Link handling
+
+static BOOL IsMarkdownPath(NSString *path) {
+    static NSSet *exts;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        exts = [NSSet setWithArray:@[@"md", @"markdown", @"mdown", @"mkd", @"mkdn",
+                                     @"mdwn", @"mdtxt", @"mdtext", @"markdn", @"rmd", @"qmd"]];
+    });
+    return [exts containsObject:path.pathExtension.lowercaseString];
+}
+
+/* Clicked links: Markdown files render in this same view (Cmd+[ goes back),
+ * web/mail links go to the system handler, other local files open with their
+ * default app. Programmatic loads (our own page) are not LinkActivated. */
+- (void)webView:(WKWebView *)webView
+decidePolicyForNavigationAction:(WKNavigationAction *)action
+decisionHandler:(void (^)(WKNavigationActionPolicy))decisionHandler {
+    NSURL *url = action.request.URL;
+    if (action.navigationType != WKNavigationTypeLinkActivated || !url) {
+        decisionHandler(WKNavigationActionPolicyAllow);
+        return;
+    }
+    NSString *scheme = url.scheme.lowercaseString;
+    if ([@[@"http", @"https", @"mailto", @"tel"] containsObject:scheme]) {
+        [[NSWorkspace sharedWorkspace] openURL:url];
+    } else if ([scheme isEqualToString:@"file"]) {
+        NSString *path = url.path;
+        BOOL isDir = NO;
+        if (!path.length || ![[NSFileManager defaultManager] fileExistsAtPath:path isDirectory:&isDir]) {
+            NSBeep();
+        } else if (!isDir && IsMarkdownPath(path)) {
+            NSString *from = self.currentPath;
+            if ([self loadMarkdownAtPath:path anchor:url.fragment] && from) [self.history addObject:from];
+        } else if (!isDir && [[NSFileManager defaultManager] isExecutableFileAtPath:path]) {
+            [[NSWorkspace sharedWorkspace] activateFileViewerSelectingURLs:@[url]]; /* never run it */
+        } else {
+            [[NSWorkspace sharedWorkspace] openURL:[NSURL fileURLWithPath:path]];
+        }
+    } else {
+        decisionHandler(WKNavigationActionPolicyAllow);
+        return;
+    }
+    decisionHandler(WKNavigationActionPolicyCancel);
+}
+
+- (BOOL)goBack {
+    while (self.history.count) {
+        NSString *path = self.history.lastObject;
+        [self.history removeLastObject];
+        if ([[NSFileManager defaultManager] fileExistsAtPath:path] && [self loadMarkdownAtPath:path]) return YES;
+    }
+    return NO;
 }
 
 /* Keep the native sheet and its WebKit printing view alive through completion,
@@ -687,9 +780,13 @@ int __stdcall ListLoadNext(HWND ParentWin, HWND PluginWin, char *FileToLoad, int
     NSString *path = FileToLoad ? [NSString stringWithUTF8String:FileToLoad] : @"";
     __block BOOL ok = NO;
     if ([NSThread isMainThread]) {
+        [view.history removeAllObjects];
         ok = [view loadMarkdownAtPath:path];
     } else {
-        dispatch_sync(dispatch_get_main_queue(), ^{ ok = [view loadMarkdownAtPath:path]; });
+        dispatch_sync(dispatch_get_main_queue(), ^{
+            [view.history removeAllObjects];
+            ok = [view loadMarkdownAtPath:path];
+        });
     }
     return ok ? LISTPLUGIN_OK : LISTPLUGIN_ERROR;
 }
